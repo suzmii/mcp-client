@@ -1,0 +1,228 @@
+import asyncio
+import json
+import os
+from asyncio import Task
+from contextlib import AsyncExitStack
+from typing import Tuple
+
+import re
+
+import aioconsole
+import httpx
+from mcp import ClientSession, StdioServerParameters, ListToolsResult
+from mcp.client.stdio import stdio_client
+
+from dotenv import load_dotenv
+from openai import OpenAI
+
+from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolParam, ChatCompletionUserMessageParam, \
+    ChatCompletionAssistantMessageParam, ChatCompletionToolMessageParam
+from openai.types.shared_params import FunctionDefinition
+
+load_dotenv()
+
+
+async def select_ollama_model(base_url: str) -> str:
+    if not ":11434" in base_url:
+        print(f"❌ 获取模型列表失败, 请手动指定模型")
+        exit(0)
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(f"{base_url.replace('/v1', '')}/api/tags")
+            response.raise_for_status()
+            models_data = response.json()
+
+        models = [model["name"] for model in models_data.get("models", [])]
+        if not models:
+            print("❌ 没有检测到本地 Ollama 模型，请先运行 `ollama pull <model>`")
+            exit(0)
+
+        while True:
+            print("\n可用的 Ollama 模型列表：")
+            for idx, name in enumerate(models):
+                print(f"{idx + 1}. {name}")
+            choice = (await aioconsole.ainput("请选择一个模型编号进行使用: ")).strip()
+            if choice.isdigit() and 1 <= int(choice) <= len(models):
+                return models[int(choice) - 1]
+            else:
+                print("无效输入，请输入一个有效编号。")
+
+    except Exception as e:
+        print(f"❌ 获取模型列表失败: {e},请手动指定模型")
+        exit(0)
+
+
+class MCPClient:
+    def __init__(self):
+        self.exit_stack = AsyncExitStack()
+        self.openai = None
+        self.model_name = None
+
+        self.sessions: dict[str, ClientSession] = {}
+        self.tool_name_to_server_map: dict[str, str] = {}
+        self.mcp_methods: list[ChatCompletionToolParam] = []
+
+        self.messages: list[ChatCompletionMessageParam] = []
+
+        self.max_token = 1024
+
+    @classmethod
+    async def create(cls, base_url: str, token: str, model: str = None, max_token: int = 1024) -> "MCPClient":
+        self = cls()
+        self.openai = OpenAI(base_url=base_url, api_key=token)
+        self.max_token = max_token
+        # 用户选择model时异步连接到mcp server
+        t1 = asyncio.create_task(self.load_and_connect_servers())
+        self.model_name = model if model else await select_ollama_model(base_url)
+        print(f"✅ 已选择模型：{self.model_name}")
+        await t1
+        return self
+
+    async def load_and_connect_servers(self):
+        try:
+            with open("mcp_servers.json", "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            servers = data.get("mcpServers", {})
+            enabled_servers = {name: cfg for name, cfg in servers.items() if cfg.get("enable")}
+
+            if not enabled_servers:
+                print("❌ 配置中没有启用的 MCP Server（请设置 enable: true）")
+                exit(1)
+
+            wait_list: list[Task[Tuple[str, ClientSession, ListToolsResult]]] = []
+
+            for name, config in enabled_servers.items():
+                async def load(name, _config) -> Tuple[str, ClientSession, ListToolsResult]:
+                    print(f"🚀 启动 MCP Server：{name} -> {_config['command']} {' '.join(_config['args'])}")
+                    server_params = StdioServerParameters(
+                        command=_config["command"],
+                        args=_config["args"],
+                        env=None
+                    )
+                    stdio_transport = await self.exit_stack.enter_async_context(stdio_client(server_params))
+                    stdio, write = stdio_transport
+                    _session = await self.exit_stack.enter_async_context(
+                        ClientSession(stdio, write))
+                    await _session.initialize()
+                    # print(f"✅ 成功连接服务器：{name}")
+                    _tool_list = await _session.list_tools()
+                    return name, _session, _tool_list
+
+                wait_list.append(asyncio.create_task(load(name, config)))
+
+            for i in wait_list:
+                # dict是异步不安全的，所以最后串行化加入
+                name, session, tool_list = await i
+                self.sessions[name] = session
+                for tool in tool_list.tools:
+                    self.tool_name_to_server_map[tool.name] = name
+                    self.mcp_methods.append(ChatCompletionToolParam(
+                        type="function",
+                        function=FunctionDefinition(
+                            name=tool.name,
+                            description=tool.description,
+                            parameters=tool.inputSchema
+                        )
+                    ))
+
+            print(f"\n📦 已加载的function：{[tool.get("function").get("name") for tool in self.mcp_methods]}")
+
+        except Exception as e:
+            print(f"❌ 读取 MCP Server 配置失败: {e}")
+            exit(1)
+
+    async def process_query(self, query: str) -> str:
+        self.messages.append(ChatCompletionUserMessageParam(role="user", content=query))
+        messages = self.messages.copy()
+
+        response = self.openai.chat.completions.create(
+            model=self.model_name,
+            messages=messages,
+            tools=self.mcp_methods,
+            tool_choice="auto",
+            max_tokens=self.max_token
+        )
+
+        final_text = []
+
+        while True:
+            choice = response.choices[0]
+            message = choice.message
+
+            if message.content:
+                cleaned = re.sub(r"<think>.*?</think>", "", message.content, flags=re.DOTALL).strip()
+                final_text.append(cleaned)
+
+            if not getattr(message, "tool_calls", None):
+                break
+
+            for tool_call in message.tool_calls:
+                tool_name = tool_call.function.name
+                tool_args = json.loads(tool_call.function.arguments)
+
+                server_name = self.tool_name_to_server_map.get(tool_name)
+                if not server_name:
+                    raise ValueError(f"未找到工具 {tool_name} 对应的 MCP Server")
+
+                session = self.sessions[server_name]
+
+                print(f"[func call] {tool_name=} {tool_args=}")
+
+                result = await session.call_tool(tool_name, tool_args)
+
+                print(f"[call result] {result.content=}\n")
+
+                assistant_message = ChatCompletionAssistantMessageParam(
+                    role="assistant",
+                    content=None,
+                    tool_calls=[tool_call]
+                )
+
+                tool_message = ChatCompletionToolMessageParam(
+                    role="tool",
+                    tool_call_id=tool_call.id,
+                    content=str(result.content)
+                )
+
+                messages.append(assistant_message)
+                messages.append(tool_message)
+
+                response = self.openai.chat.completions.create(
+                    model=self.model_name,
+                    messages=messages,
+                    tools=self.mcp_methods,
+                    tool_choice="auto",
+                    max_tokens=self.max_token
+                )
+        self.messages.append(ChatCompletionAssistantMessageParam(role="assistant", content="\n".join(final_text)))
+        return "\n".join(final_text)
+
+    async def chat_loop(self):
+        print("\nMCP Client Started!")
+        print("Type your queries or 'quit' to exit.")
+        while True:
+            try:
+                query = input("\n请输入: ").strip()
+                if query.lower() == 'quit':
+                    break
+
+                response = await self.process_query(query)
+                print("\n" + response)
+            except Exception as e:
+                print(f"\nError: {str(e)}")
+
+    async def cleanup(self):
+        await self.exit_stack.aclose()
+
+
+async def main():
+    client = await MCPClient.create(os.getenv("BASE_URL"), os.getenv("TOKEN"), os.getenv("MODEL"))
+    try:
+        await client.chat_loop()
+    finally:
+        await client.cleanup()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
