@@ -54,5 +54,15 @@ async def chat(request: Request):
     messages.append({"role": "assistant", "content": response})
     return {"response": response}
 
+@app.post("/nosession-chat")
+async def nosession_chat(request: Request):
+    data = await request.json()
+    content = data.get("content")
+    try:
+        response = await client.process_query([{"role": "user", "content": content}])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"response": response}
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
