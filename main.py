@@ -1,20 +1,29 @@
+import asyncio
 import os
-from dotenv import load_dotenv
-
-load_dotenv()
+from typing import Dict, List
 
 import uvicorn
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 
-import asyncio
-from typing import Dict, List
-from fastapi import FastAPI, Request, HTTPException
 from mcp_client import MCPClient
+
+load_dotenv()
 
 
 sessions: Dict[str, List[Dict[str, str]]] = {}
 client: MCPClient = None
 
 app = FastAPI(debug=True)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 @app.on_event("startup")
 async def startup():
@@ -24,11 +33,8 @@ async def startup():
     model = os.getenv("MODEL")
     if not token:
         raise RuntimeError("Missing TOKEN or OPENAI_API_KEY in environment")
-    client = await MCPClient.create(
-        base_url=base_url,
-        token=token,
-        model=model
-    )
+    client = await MCPClient.create(base_url=base_url, token=token, model=model)
+
 
 @app.post("/sessions")
 async def create_session(request: Request):
@@ -37,6 +43,7 @@ async def create_session(request: Request):
     context = data.get("context", [])
     sessions[session_id] = context.copy()
     return {"success": True}
+
 
 @app.post("/chat")
 async def chat(request: Request):
@@ -54,15 +61,17 @@ async def chat(request: Request):
     messages.append({"role": "assistant", "content": response})
     return {"response": response}
 
+
 @app.post("/nosession-chat")
 async def nosession_chat(request: Request):
     data = await request.json()
     content = data.get("content")
     try:
-        response = await client.process_query([{"role": "user", "content": content}])
+        response = await client.process_query([{"role": "user", "content": f"以下是用户的问题，请注意你不需要回答用户，而是简要概括用户含义，返回十个字以内的内容作为概述：{content}{content}"}])
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     return {"response": response}
 
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000, timeout_keep_alive=0)
